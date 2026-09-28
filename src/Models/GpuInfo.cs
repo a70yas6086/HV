@@ -1,0 +1,34 @@
+namespace ExHyperV.Models
+{
+    /// <summary>主机可分区显卡（GPU-PV 分配源），由 VmGpuService.GetHostGpusAsync 生产。</summary>
+    public class GpuInfo
+    {
+        public string Name { get; init; } = string.Empty;          // 显卡名称
+        public string Manu { get; init; } = string.Empty;          // 芯片商（NVIDIA/AMD，匹配图标用）
+        public string InstanceId { get; init; } = string.Empty;    // 显卡实例 ID
+        public string DriverVersion { get; init; } = string.Empty; // 驱动版本
+        public string Vendor { get; init; } = string.Empty;        // 板卡厂商（ASUS/MSI 等，文字显示用）
+
+        public string PartitionableGpuPath { get; set; } = string.Empty; // Msvm_PartitionableGpu.Name（GetHostGpusAsync 二次填充）
+        public ulong MemoryBytes { get; set; }                         // 物理显存字节数（按当前设备实例精确读取）
+
+        /// <summary>清洗后的设备路径（优先 PartitionableGpuPath，回退 InstanceId）：去 \\?\ 前缀、截断 #{guid}、# 还原为 \。</summary>
+        public string PathDisplay
+        {
+            get
+            {
+                string rawPath = !string.IsNullOrEmpty(PartitionableGpuPath) ? PartitionableGpuPath : InstanceId;
+                if (string.IsNullOrWhiteSpace(rawPath)) return Properties.Resources.Common_UnknownPath;
+                try
+                {
+                    string cleanId = rawPath;
+                    if (cleanId.StartsWith(@"\\?\")) cleanId = cleanId.Substring(4);
+                    int guidIndex = cleanId.IndexOf("#{");
+                    if (guidIndex != -1) cleanId = cleanId.Substring(0, guidIndex);
+                    return cleanId.Replace('#', '\\');
+                }
+                catch { return rawPath; }
+            }
+        }
+    }
+}

@@ -1,0 +1,159 @@
+using ExHyperV.Tools;
+
+namespace ExHyperV.Services
+{
+    public static class CpuAffinityService
+    {
+        /// <summary>读取持久化的亲和性设置；没有记录时查询当前调度器状态。</summary>
+        public static async Task<List<int>> GetCpuAffinityAsync(Guid vmId, string notes)
+        {
+            string savedAffinity = NotesTag.Get(notes, "Affinity");
+            if (!string.IsNullOrEmpty(savedAffinity))
+            {
+                try
+                {
+                    return savedAffinity.Split(',')
+                        .Select(s => int.Parse(s.Trim()))
+                        .ToList();
+                }
+                catch { /* 解析失败则回退到探测逻辑 */ }
+            }
+
+            if (vmId == Guid.Empty) return new List<int>();
+            var scheduler = HyperVSchedulerService.GetSchedulerType();
+
+            if (scheduler == HyperVSchedulerType.Root)
+            {
+                return await Task.Run(() => ProcessAffinityService.GetVmProcessAffinity(vmId));
+            }
+
+            // Classic/Core 模式：从 HCS CPU Group 中读取
+            var groupIdResp = await GetVmCpuGroupIdAsync(vmId);
+            if (!groupIdResp.HasData || groupIdResp.Data == Guid.Empty)
+                return new List<int>();
+
+            var groupDetail = await GetCpuGroupDetailsAsync(groupIdResp.Data);
+            if (groupDetail?.Affinity?.LogicalProcessors == null)
+                return new List<int>();
+
+            return groupDetail.Affinity.LogicalProcessors.Select(u => (int)u).ToList();
+        }
+
+        /// <summary>按当前调度器设置虚拟机 CPU 亲和性。</summary>
+        /// <param name="vmId">虚拟机 ID</param>
+        /// <param name="coreIndices">选中的核心索引列表</param>
+        /// <param name="isVmRunning">虚拟机当前是否正在运行（Root 模式必须开启）</param>
+        public static async Task<bool> SetCpuAffinityAsync(Guid vmId, List<int> coreIndices, bool isVmRunning)
+        {
+            if (vmId == Guid.Empty) return false;
+
+            var scheduler = HyperVSchedulerService.GetSchedulerType();
+
+            if (scheduler == HyperVSchedulerType.Root)
+            {
+                // Root 调度器通过运行中的 vmmem 进程应用亲和性。
+                if (!isVmRunning)
+                    return false;
+
+                return await Task.Run(() => ProcessAffinityService.SetVmProcessAffinity(vmId, coreIndices));
+            }
+            else
+            {
+                try
+                {
+                    Guid targetGroupId = Guid.Empty;
+                    if (coreIndices != null && coreIndices.Count > 0)
+                    {
+                        targetGroupId = await FindOrCreateCpuGroupAsync(coreIndices);
+                        if (targetGroupId == Guid.Empty) return false;
+                    }
+
+                    // 将 VM 关联到该组（targetGroupId == Empty 即解除组限制）
+                    // 走 WMI ModifyResourceSettings 改 Msvm_ProcessorSettingData.CpuGroupId
+                    string groupIdStr = targetGroupId.ToString("D");
+                    var bindResp = await WmiApi.WithObjectAsync(
+                        wql: $"SELECT * FROM Msvm_ProcessorSettingData WHERE InstanceID LIKE '%{vmId}%'",
+                        modifier: obj => obj["CpuGroupId"] = groupIdStr,
+                        submitMethod: "ModifyResourceSettings",
+                        submitParamName: "ResourceSettings",
+                        wrapInArray: true);
+
+                    return bindResp.Success;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 同步尝试为 vmmem 进程设置一次 CPU 亲和性，返回是否成功。
+        /// vmmem 进程在 VM 刚启动时可能尚未就绪（返回 false），供 ViewModel 重试调用。
+        /// </summary>
+        public static bool TrySetVmmemAffinity(Guid vmId, List<int> coreIds)
+            => ProcessAffinityService.SetVmProcessAffinity(vmId, coreIds);
+
+        // HCS CPU Group 辅助方法（仅供 Classic/Core 模式使用，外部无调用方 → private）
+
+        private static async Task<Guid> FindOrCreateCpuGroupAsync(List<int> selectedCores)
+        {
+            if (selectedCores == null || !selectedCores.Any())
+            {
+                return Guid.Empty;
+            }
+
+            var selectedCoresSet = new HashSet<uint>(selectedCores.Select(c => (uint)c));
+            var existingGroups = await GetAllCpuGroupsAsync();
+
+            if (existingGroups != null)
+            {
+                foreach (var group in existingGroups)
+                {
+                    if (group.Affinity?.LogicalProcessors != null)
+                    {
+                        var existingCoresSet = new HashSet<uint>(group.Affinity.LogicalProcessors);
+                        if (existingCoresSet.SetEquals(selectedCoresSet))
+                        {
+                            return group.GroupId;
+                        }
+                    }
+                }
+            }
+
+            var sortedSelectedCores = selectedCores.Select(c => (uint)c).OrderBy(c => c).ToArray();
+            var newGroupId = Guid.NewGuid();
+            var createResp = await HcsApi.CreateCpuGroupAsync(newGroupId, sortedSelectedCores);
+            if (!createResp.Success) return Guid.Empty;
+
+            return newGroupId;
+        }
+
+        private static async Task<HcsCpuGroupDetail?> GetCpuGroupDetailsAsync(Guid groupId)
+        {
+            if (groupId == Guid.Empty) return null;
+            var allGroups = await GetAllCpuGroupsAsync();
+            return allGroups?.FirstOrDefault(g => g.GroupId == groupId);
+        }
+
+        private static async Task<List<HcsCpuGroupDetail>?> GetAllCpuGroupsAsync()
+        {
+            var resp = await HcsApi.GetAllCpuGroupsAsync();
+            return resp.HasData ? resp.Data : null;
+        }
+
+        /// <summary>
+        /// 读取 VM 当前所属的 CPU Group ID。
+        /// VM↔组的关联存于 WMI（Msvm_ProcessorSettingData.CpuGroupId），读写都走 WmiApi；
+        /// 组本身的增删/列举才走 HcsApi(vmcompute)。返回 Guid.Empty 表示未分配。
+        /// </summary>
+        private static async Task<ApiResponse<Guid>> GetVmCpuGroupIdAsync(Guid vmId)
+        {
+            return await WmiApi.QueryFirstAsync(
+                $"SELECT CpuGroupId FROM Msvm_ProcessorSettingData WHERE InstanceID LIKE '%{vmId}%'",
+                obj => (obj["CpuGroupId"] != null &&
+                        Guid.TryParse(obj["CpuGroupId"].ToString(), out Guid g))
+                       ? g : Guid.Empty);
+        }
+    }
+}

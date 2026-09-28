@@ -1,0 +1,646 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using System.Collections.ObjectModel;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using ExHyperV.Models;
+using ExHyperV.Services;
+using ExHyperV.Tools;
+
+namespace ExHyperV.ViewModels
+{
+    /// <summary>
+    /// 为 <see cref="VmInstance"/> 提供可观察属性；集合与模型共享，刷新时原位合并以保持现有绑定。
+    /// </summary>
+    public partial class VmInstanceViewModel : ObservableObject
+    {
+
+        public VmInstance Model { get; }
+
+
+
+        [ObservableProperty] private bool _isEditing;
+        [ObservableProperty] private string _editedName = string.Empty;
+
+        public void StartEditing()
+        {
+            EditedName = Name;
+            IsEditing = true;
+        }
+
+
+
+        [ObservableProperty] private Guid _id;
+        partial void OnIdChanged(Guid value) { if (Model != null) Model.Id = value; }
+
+        [ObservableProperty] private string _name = string.Empty;
+        partial void OnNameChanged(string value) { if (Model != null) Model.Name = value; }
+
+        [ObservableProperty] private string _notes = string.Empty;
+        partial void OnNotesChanged(string value) { if (Model != null) Model.Notes = value; }
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(ConfigSummary))]
+        [NotifyPropertyChangedFor(nameof(CanChangeBootOrder))]
+        [NotifyPropertyChangedFor(nameof(CanToggleConsoleSupport))]
+        private int _generation;
+        partial void OnGenerationChanged(int value) { if (Model != null) Model.Generation = value; }
+
+        [ObservableProperty] private string _version = "0.0";
+        partial void OnVersionChanged(string value) { if (Model != null) Model.Version = value; }
+
+        [ObservableProperty] private string _osType = "Windows";
+        partial void OnOsTypeChanged(string value) { if (Model != null) Model.OsType = value; }
+
+        [ObservableProperty] private string _state = string.Empty;
+        [ObservableProperty] private string _uptime = "00:00:00";
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(CanChangeBootOrder))]
+        [NotifyPropertyChangedFor(nameof(CanToggleConsoleSupport))]
+        [NotifyPropertyChangedFor(nameof(CanEditSecurity))]
+        private bool _isRunning;
+
+        /// <summary>
+        /// 仅在 Hyper-V 明确报告 EnabledState=3（已关闭），且当前没有本地过渡状态时为 true。
+        /// 保存、暂停和所有启动/停止过渡状态都不属于完全关机。
+        /// </summary>
+        public bool IsPoweredOff => _transientState == null && _backendCode == 3;
+
+        public bool CanChangeBootOrder => !(Generation == 1 && IsRunning);
+
+        // 控制台支持开关仅适用于第 2 代虚拟机（Enable/Disable-VMConsoleSupport 官方仅 Gen2 可用），且需关机时改
+        public bool CanToggleConsoleSupport => Generation == 2 && !IsRunning;
+
+        // 安全启动 / vTPM 仅第 2 代可用，且需关机时改（与创建页的安全特性一致）
+        public bool CanEditSecurity => Generation == 2 && !IsRunning;
+
+        [ObservableProperty] private BitmapSource? _thumbnail;
+
+        [ObservableProperty] private string _ipAddress = "---";
+        [ObservableProperty] private string _ipAddressDisplay = "---";
+
+        partial void OnIpAddressChanged(string value)
+        {
+            if (Model != null) Model.IpAddress = value;
+            RecomputeIpAddressDisplay(value);
+        }
+
+        [ObservableProperty] private string _macAddress = "00:00:00:00:00:00";
+        partial void OnMacAddressChanged(string value) { if (Model != null) Model.MacAddress = value; }
+
+        private TimeSpan _anchorUptime;
+        private DateTime _anchorLocalTime;
+        private string? _transientState;
+        private string? _backendState;
+        private ushort _backendCode;
+
+
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(ConfigSummary))]
+        private int _cpuCount;
+        partial void OnCpuCountChanged(int value) { if (Model != null) Model.CpuCount = value; }
+
+        [ObservableProperty] private double _averageUsage;
+        [ObservableProperty] private int _columns = 2;
+        [ObservableProperty] private int _rows = 1;
+        public ObservableCollection<VmCoreItem> Cores { get; } = new();
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(ConfigSummary))]
+        private double _memoryGb;
+        partial void OnMemoryGbChanged(double value) { if (Model != null) Model.MemoryGb = value; }
+
+        [ObservableProperty] private VmProcessorSettings? _processor;
+        partial void OnProcessorChanged(VmProcessorSettings? value) { if (Model != null) Model.Processor = value; }
+
+        [ObservableProperty] private VmMemorySettings? _memorySettings;
+        partial void OnMemorySettingsChanged(VmMemorySettings? value) { if (Model != null) Model.MemorySettings = value; }
+
+        [ObservableProperty] private VmMmioSettings? _mmioSettings;
+        partial void OnMmioSettingsChanged(VmMmioSettings? value) { if (Model != null) Model.MmioSettings = value; }
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(MemoryUsageString))]
+        [NotifyPropertyChangedFor(nameof(MemoryLimitString))]
+        private double _assignedMemoryGb;
+        partial void OnAssignedMemoryGbChanged(double value) { if (Model != null) Model.AssignedMemoryGb = value; }
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(MemoryDemandString))]
+        private double _demandMemoryGb;
+        partial void OnDemandMemoryGbChanged(double value) { if (Model != null) Model.DemandMemoryGb = value; }
+
+        [ObservableProperty] private PointCollection? _memoryHistoryPoints;
+
+        private readonly LinkedList<double> _memoryUsageHistory = new();
+        private const int MaxHistoryLength = 60;
+
+
+
+        public ObservableCollection<VmDiskItem> Disks => Model.Disks;
+        public ObservableCollection<VmStorageItem> StorageItems => Model.StorageItems;
+        public ObservableCollection<VmNetworkAdapter> NetworkAdapters => Model.NetworkAdapters;
+        public ObservableCollection<BootOrderItem> BootOrderItems => Model.BootOrderItems;
+        public ObservableCollection<VmGpuAssignment> AssignedGpus => Model.AssignedGpus;
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(ConfigSummary))]
+        private double _totalDiskSizeGb;
+        partial void OnTotalDiskSizeGbChanged(double value) { if (Model != null) Model.TotalDiskSizeGb = value; }
+
+
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(HasGpu))]
+        [NotifyPropertyChangedFor(nameof(GpuDisplayLabel))]
+        private string? _gpuName;
+        partial void OnGpuNameChanged(string? value)
+        {
+            if (Model != null) Model.GpuName = value;
+            OnPropertyChanged(nameof(HasGpu));
+        }
+
+        public string GpuDisplayLabel
+        {
+            get
+            {
+                if (AssignedGpus != null && AssignedGpus.Count > 0)
+                {
+                    var groups = AssignedGpus.GroupBy(g => g.Name).ToList();
+                    var mainGroup = groups[0];
+                    string mainName = mainGroup.Key;
+                    int mainCount = mainGroup.Count();
+
+                    string result = mainName;
+                    if (mainCount > 1) result += $" *{mainCount}";
+                    if (groups.Count > 1) result += " +";
+                    return result;
+                }
+
+                if (!string.IsNullOrEmpty(GpuName))
+                    return GpuName;
+
+                return Properties.Resources.Common_None;
+            }
+        }
+
+        public void RefreshGpuSummary() => OnPropertyChanged(nameof(GpuDisplayLabel));
+
+        public bool HasGpu => (AssignedGpus != null && AssignedGpus.Count > 0) || !string.IsNullOrEmpty(GpuName);
+
+        // GPU 实时监控
+        [ObservableProperty][NotifyPropertyChangedFor(nameof(GpuMaxUsage))] private double _gpu3dUsage;
+        [ObservableProperty][NotifyPropertyChangedFor(nameof(GpuMaxUsage))] private double _gpuCopyUsage;
+        [ObservableProperty][NotifyPropertyChangedFor(nameof(GpuMaxUsage))] private double _gpuEncodeUsage;
+        [ObservableProperty][NotifyPropertyChangedFor(nameof(GpuMaxUsage))] private double _gpuDecodeUsage;
+
+        public double GpuMaxUsage => Math.Max(Math.Max(Gpu3dUsage, GpuCopyUsage), Math.Max(GpuEncodeUsage, GpuDecodeUsage));
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(HasGpu))]
+        private bool _isGpuActive;
+        partial void OnIsGpuActiveChanged(bool value) { if (Model != null) Model.IsGpuActive = value; }
+
+        [ObservableProperty] private PointCollection? _gpu3dHistoryPoints;
+        [ObservableProperty] private PointCollection? _gpuCopyHistoryPoints;
+        [ObservableProperty] private PointCollection? _gpuEncodeHistoryPoints;
+        [ObservableProperty] private PointCollection? _gpuDecodeHistoryPoints;
+
+        private readonly LinkedList<double> _gpu3dHistory = new();
+        private readonly LinkedList<double> _gpuCopyHistory = new();
+        private readonly LinkedList<double> _gpuEncodeHistory = new();
+        private readonly LinkedList<double> _gpuDecodeHistory = new();
+
+
+
+        public IAsyncRelayCommand<string>? ControlCommand { get; set; }
+
+        // 右键菜单电源项：运行中→关机（Stop，与主关机键一致：优雅关机失败则硬关），否则→启动。随 IsRunning 变化通知。
+        public string PowerToggleText => IsRunning ? Properties.Resources.Button_ShutDown : Properties.Resources.Button_Start;
+        public string PowerToggleAction => IsRunning ? "Stop" : "Start";
+
+
+
+        public VmInstanceViewModel(VmInstance model)
+        {
+            Model = model ?? throw new ArgumentNullException(nameof(model));
+
+            // 构造期直接写字段，避免 setter 将相同值反写模型。
+            _id = model.Id;
+            _name = model.Name;
+            _notes = model.Notes;
+            _generation = model.Generation;
+            _version = model.Version;
+            _osType = model.OsType;
+            CpuCount = model.CpuCount;
+            MemoryGb = model.MemoryGb;
+            AssignedMemoryGb = model.AssignedMemoryGb;
+            DemandMemoryGb = model.DemandMemoryGb;
+            _totalDiskSizeGb = model.TotalDiskSizeGb;
+            _ipAddress = model.IpAddress;
+            _macAddress = model.MacAddress;
+            _gpuName = model.GpuName;
+            _isGpuActive = model.IsGpuActive;
+            _processor = model.Processor;
+            MemorySettings = model.MemorySettings;
+            MmioSettings = model.MmioSettings;
+
+            RecomputeIpAddressDisplay(_ipAddress);
+
+            InitializeGpuHistory();
+            SyncBackendData(model.StateText, model.StateCode, model.RawUptime);
+
+            Disks.CollectionChanged += (s, e) =>
+            {
+                TotalDiskSizeGb = Disks.Sum(d => d.MaxSize) / 1073741824.0;
+                OnPropertyChanged(nameof(ConfigSummary));
+            };
+            // 集合变化也要刷 HasGpu/GpuDisplayLabel
+            AssignedGpus.CollectionChanged += (s, e) =>
+            {
+                OnPropertyChanged(nameof(HasGpu));
+                OnPropertyChanged(nameof(GpuDisplayLabel));
+            };
+
+        }
+
+        private void RecomputeIpAddressDisplay(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value == "---")
+            {
+                IpAddressDisplay = value;
+                return;
+            }
+            var ips = value.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries);
+            var ipv4 = ips.FirstOrDefault(ip => ip.Contains(".") && !ip.Contains(":"));
+            IpAddressDisplay = !string.IsNullOrWhiteSpace(ipv4)
+                ? ipv4.Trim()
+                : (ips.FirstOrDefault()?.Trim() ?? value);
+        }
+
+        private void InitializeGpuHistory()
+        {
+            _gpu3dHistory.Clear(); _gpuCopyHistory.Clear();
+            _gpuEncodeHistory.Clear(); _gpuDecodeHistory.Clear();
+            for (int i = 0; i < MaxHistoryLength; i++)
+            {
+                _gpu3dHistory.AddLast(0.0);
+                _gpuCopyHistory.AddLast(0.0);
+                _gpuEncodeHistory.AddLast(0.0);
+                _gpuDecodeHistory.AddLast(0.0);
+            }
+            RefreshGpuPoints();
+        }
+
+
+        // 调用方：PageVM.MonitorStateLoop 周期刷新 / SyncSingleVmStateAsync 单 VM 刷新
+        // skipNameUpdate=true：PageVM 的 rename lockout 期内跳过 Name 同步
+        // skipNetworkAdapters=true：用户在 NetworkSettings 页或 IsLoadingSettings 时跳过适配器抖动
+
+        public void Apply(VmInstance fresh, bool skipNameUpdate = false, bool skipNetworkAdapters = false)
+        {
+            if (fresh == null) return;
+
+            if (!skipNameUpdate && Name != fresh.Name) Name = fresh.Name;
+            if (CpuCount != fresh.CpuCount) CpuCount = fresh.CpuCount;
+            if (MemoryGb != fresh.MemoryGb) MemoryGb = fresh.MemoryGb;
+            if (Generation != fresh.Generation) Generation = fresh.Generation;
+            if (Version != fresh.Version) Version = fresh.Version;
+            Notes = fresh.Notes;
+
+            SyncBackendData(fresh.StateText, fresh.StateCode, fresh.RawUptime);
+
+            if (!IsRunning) IpAddress = "---";
+
+            // 网络页编辑期间不合并适配器，避免刷新覆盖输入。
+            if (!skipNetworkAdapters)
+                ReconcileNetworkAdapters(NetworkAdapters, fresh.NetworkAdapters);
+
+            ReconcileDisks(Disks, fresh.Disks, runningRefresh: IsRunning);
+
+            // 磁盘容量(MaxSize)可能在合并中变化(扩容/换盘)，而元素属性变化不触发集合事件——
+            // 这里重算总量，其 setter 经 NotifyPropertyChangedFor 带动 ConfigSummary 刷新(只靠增删的 CollectionChanged 会漏)
+            double freshTotalGb = Disks.Sum(d => d.MaxSize) / 1073741824.0;
+            if (Math.Abs(TotalDiskSizeGb - freshTotalGb) > 0.0001) TotalDiskSizeGb = freshTotalGb;
+
+            // ── 6. GPU 摘要名 ─────────────────────────────────────
+            GpuName = fresh.GpuName;
+        }
+
+        private static void ReconcileNetworkAdapters(
+            ObservableCollection<VmNetworkAdapter> currentList,
+            IEnumerable<VmNetworkAdapter> newList)
+        {
+            if (newList == null) return;
+            var newSnapshot = newList.ToList();
+
+            var toRemove = currentList.Where(c => !newSnapshot.Any(n => n.Id == c.Id)).ToList();
+            foreach (var item in toRemove) currentList.Remove(item);
+
+            foreach (var newItem in newSnapshot)
+            {
+                var existingItem = currentList.FirstOrDefault(c => c.Id == newItem.Id);
+                if (existingItem != null)
+                {
+                    existingItem.Name = newItem.Name;
+                    existingItem.IsConnected = newItem.IsConnected;
+                    existingItem.SwitchName = newItem.SwitchName;
+                    existingItem.MacAddress = newItem.MacAddress;
+                    existingItem.IsStaticMac = newItem.IsStaticMac;
+                    existingItem.SendSpeedBps = newItem.SendSpeedBps;
+                    existingItem.ReceiveSpeedBps = newItem.ReceiveSpeedBps;
+                    existingItem.HasNetworkSpeedSample = newItem.HasNetworkSpeedSample;
+                    if (newItem.IpAddresses != null && newItem.IpAddresses.Count > 0)
+                        existingItem.IpAddresses = newItem.IpAddresses;
+                    existingItem.VlanMode = newItem.VlanMode;
+                    existingItem.AccessVlanId = newItem.AccessVlanId;
+                    existingItem.NativeVlanId = newItem.NativeVlanId;
+                    existingItem.TrunkAllowedVlanIds = newItem.TrunkAllowedVlanIds;
+                    existingItem.PvlanMode = newItem.PvlanMode;
+                    existingItem.PvlanPrimaryId = newItem.PvlanPrimaryId;
+                    existingItem.PvlanSecondaryId = newItem.PvlanSecondaryId;
+                    existingItem.BandwidthLimit = newItem.BandwidthLimit;
+                    existingItem.BandwidthReservation = newItem.BandwidthReservation;
+                    existingItem.MacSpoofingAllowed = newItem.MacSpoofingAllowed;
+                    existingItem.DhcpGuardEnabled = newItem.DhcpGuardEnabled;
+                    existingItem.RouterGuardEnabled = newItem.RouterGuardEnabled;
+                    existingItem.MonitorMode = newItem.MonitorMode;
+                    existingItem.StormLimit = newItem.StormLimit;
+                    existingItem.TeamingAllowed = newItem.TeamingAllowed;
+                    existingItem.VmqEnabled = newItem.VmqEnabled;
+                    existingItem.SriovEnabled = newItem.SriovEnabled;
+                    existingItem.IpsecOffloadEnabled = newItem.IpsecOffloadEnabled;
+                }
+                else
+                {
+                    currentList.Add(newItem);
+                }
+            }
+        }
+
+        private static void ReconcileDisks(
+            ObservableCollection<VmDiskItem> currentList,
+            IEnumerable<VmDiskItem> newList,
+            bool runningRefresh)
+        {
+            if (newList == null) return;
+            var newSnapshot = newList.ToList();
+
+            var updatePaths = newSnapshot.Select(d => d.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = currentList.Count - 1; i >= 0; i--)
+            {
+                if (!updatePaths.Contains(currentList[i].Path))
+                    currentList.RemoveAt(i);
+            }
+
+            foreach (var newDiskData in newSnapshot)
+            {
+                var existingDisk = currentList.FirstOrDefault(d => d.Path.Equals(newDiskData.Path, StringComparison.OrdinalIgnoreCase));
+                if (existingDisk != null)
+                {
+                    existingDisk.Name = newDiskData.Name;
+                    existingDisk.MaxSize = newDiskData.MaxSize;
+                    existingDisk.DiskType = newDiskData.DiskType;
+
+                    if (runningRefresh && existingDisk.DiskType != "Physical" && System.IO.File.Exists(existingDisk.Path))
+                    {
+                        try
+                        {
+                            long realSizeBytes = new System.IO.FileInfo(existingDisk.Path).Length;
+                            if (existingDisk.CurrentSize != realSizeBytes)
+                                existingDisk.CurrentSize = realSizeBytes;
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        existingDisk.CurrentSize = newDiskData.CurrentSize;
+                    }
+                }
+                else
+                {
+                    currentList.Add(newDiskData);
+                }
+            }
+        }
+
+
+
+        public string MemoryUsageString => AssignedMemoryGb.ToString("N1");
+        public string MemoryDemandString => DemandMemoryGb.ToString("N1");
+
+        public string MemoryLimitString
+        {
+            get
+            {
+                if (MemorySettings != null)
+                {
+                    double limitMb = MemorySettings.DynamicMemoryEnabled ? MemorySettings.Maximum : MemorySettings.Startup;
+                    return (limitMb / 1024.0).ToString("N1");
+                }
+                return MemoryGb > 0 ? MemoryGb.ToString("N1") : "0.0";
+            }
+        }
+
+        public void UpdateMemoryStatus(long assignedMb, int availablePercent)
+        {
+            if (!IsRunning)
+            {
+                AssignedMemoryGb = 0; DemandMemoryGb = 0; UpdateHistoryPoints(0); return;
+            }
+            if (assignedMb == 0)
+            {
+                // 运行中但 guest 没报告内存使用(静态内存 / 无集成服务，查不到 demand)——按满额(已分配全部)显示，而非 0
+                AssignedMemoryGb = MemoryGb; DemandMemoryGb = MemoryGb; UpdateHistoryPoints(100); return;
+            }
+            AssignedMemoryGb = assignedMb / 1024.0;
+            double usedPercentage = (100 - availablePercent) / 100.0;
+            DemandMemoryGb = AssignedMemoryGb * usedPercentage;
+            UpdateHistoryPoints(100 - availablePercent);
+        }
+
+        private void UpdateHistoryPoints(double pressurePercent)
+        {
+            pressurePercent = Math.Max(0, Math.Min(100, pressurePercent));
+            _memoryUsageHistory.AddLast(pressurePercent);
+            if (_memoryUsageHistory.Count > MaxHistoryLength) _memoryUsageHistory.RemoveFirst();
+            var points = new PointCollection();
+            int count = _memoryUsageHistory.Count;
+            int offset = MaxHistoryLength - count;
+            points.Add(new Point(offset, 100));
+
+            int i = 0;
+            foreach (var val in _memoryUsageHistory)
+            {
+                points.Add(new Point(offset + i, 100 - val));
+                i++;
+            }
+            points.Add(new Point(MaxHistoryLength - 1, 100));
+            points.Freeze();
+            MemoryHistoryPoints = points;
+        }
+
+        public void UpdateGpuStats(VmQueryService.GpuUsageData data)
+        {
+            if (!IsRunning)
+            {
+                Gpu3dUsage = 0;
+                GpuCopyUsage = 0;
+                GpuEncodeUsage = 0;
+                GpuDecodeUsage = 0;
+                IsGpuActive = false;
+            }
+            else
+            {
+                Gpu3dUsage = Math.Clamp(data.Gpu3d, 0, 100);
+                GpuCopyUsage = Math.Clamp(data.GpuCopy, 0, 100);
+                GpuEncodeUsage = Math.Clamp(data.GpuEncode, 0, 100);
+                GpuDecodeUsage = Math.Clamp(data.GpuDecode, 0, 100);
+
+                bool hasEngineUsage = Gpu3dUsage > 0 || GpuCopyUsage > 0 || GpuEncodeUsage > 0 || GpuDecodeUsage > 0;
+                bool isLinuxGuest = !string.IsNullOrWhiteSpace(OsType) && OsType.Contains("linux", StringComparison.OrdinalIgnoreCase);
+
+                IsGpuActive = data.IsDriverBound || hasEngineUsage || (HasGpu && isLinuxGuest);
+            }
+            UpdateSingleGpuHistory(_gpu3dHistory, Gpu3dUsage);
+            UpdateSingleGpuHistory(_gpuCopyHistory, GpuCopyUsage);
+            UpdateSingleGpuHistory(_gpuEncodeHistory, GpuEncodeUsage);
+            UpdateSingleGpuHistory(_gpuDecodeHistory, GpuDecodeUsage);
+
+            RefreshGpuPoints();
+            OnPropertyChanged(nameof(GpuMaxUsage));
+        }
+
+        private void UpdateSingleGpuHistory(LinkedList<double> history, double value)
+        {
+            history.AddLast(Math.Max(0, Math.Min(100, value)));
+            if (history.Count > MaxHistoryLength) history.RemoveFirst();
+        }
+
+        private void RefreshGpuPoints()
+        {
+            Gpu3dHistoryPoints = CalculateGpuPoints(_gpu3dHistory);
+            GpuCopyHistoryPoints = CalculateGpuPoints(_gpuCopyHistory);
+            GpuEncodeHistoryPoints = CalculateGpuPoints(_gpuEncodeHistory);
+            GpuDecodeHistoryPoints = CalculateGpuPoints(_gpuDecodeHistory);
+        }
+
+        private static PointCollection CalculateGpuPoints(LinkedList<double> history)
+        {
+            double w = 100.0, h = 100.0;
+            double step = w / (MaxHistoryLength - 1);
+            var points = new PointCollection(MaxHistoryLength + 2) { new Point(0, h) };
+            int i = 0;
+            foreach (var val in history) points.Add(new Point(i++ * step, h - val));
+            points.Add(new Point(w, h));
+            points.Freeze();
+            return points;
+        }
+
+        public string ConfigSummary
+        {
+            get
+            {
+                string diskPart;
+                if (Disks == null || Disks.Count == 0)
+                    diskPart = Properties.Resources.Common_NoDisk;
+                else
+                {
+                    diskPart = string.Join(" + ", Disks
+                        .Select(d => d.MaxSize / 1073741824.0)
+                        .OrderByDescending(g => g)
+                        .Select(g => g >= 1 ? $"{g:0.#} GB" : $"{g * 1024:0} MB"));
+                }
+                return string.Format(Properties.Resources.Format_VmSummary, CpuCount, MemoryGb, diskPart);
+            }
+        }
+
+
+        // 合成最终显示的 State；并由此推导 IsRunning
+
+        public void SyncBackendData(string realState, ushort realCode, TimeSpan realUptime)
+        {
+            bool wasRunning = this.IsRunning;
+
+            _backendState = realState;
+            _backendCode = realCode;
+            _anchorUptime = realUptime;
+            _anchorLocalTime = DateTime.Now;
+
+            // 同步进 Model（StateText / StateCode / RawUptime 是 Service 读取的字段）
+            if (Model != null)
+            {
+                Model.StateText = realState;
+                Model.StateCode = realCode;
+                Model.RawUptime = realUptime;
+            }
+
+            if (_transientState != null && ShouldClearTransientState(realState))
+                _transientState = null;
+
+            RefreshStateDisplay();
+
+            if (wasRunning != this.IsRunning)
+            {
+                OnPropertyChanged(nameof(IsRunning));
+                OnPropertyChanged(nameof(PowerToggleText));
+                OnPropertyChanged(nameof(PowerToggleAction));
+            }
+
+            TickUptime();
+        }
+
+        public void TickUptime()
+        {
+            if (!IsRunning) { Uptime = "00:00:00"; return; }
+            var currentTotal = _anchorUptime + (DateTime.Now - _anchorLocalTime);
+            Uptime = currentTotal.TotalDays >= 1
+                ? $"{(int)currentTotal.TotalDays}.{currentTotal.Hours:D2}:{currentTotal.Minutes:D2}:{currentTotal.Seconds:D2}"
+                : $"{currentTotal.Hours:D2}:{currentTotal.Minutes:D2}:{currentTotal.Seconds:D2}";
+        }
+
+        private void RefreshStateDisplay()
+        {
+            State = _transientState ?? _backendState ?? string.Empty;
+            // 乐观态期间(用户刚发起操作)一律视为活动；否则按后端原始状态码白名单判定，
+            // 避免"合并磁盘/未知/等待启动"等非运行态被误判为运行(原字符串黑名单只排除 Off/Paused/Saved，会漏)
+            IsRunning = _transientState != null || VmMapper.IsActiveState(_backendCode);
+            OnPropertyChanged(nameof(IsPoweredOff));
+
+            if (!IsRunning)
+            {
+                UpdateMemoryStatus(0, 0);
+                IsGpuActive = false;
+                Gpu3dUsage = 0;
+                GpuCopyUsage = 0;
+                GpuEncodeUsage = 0;
+                GpuDecodeUsage = 0;
+                UpdateSingleGpuHistory(_gpu3dHistory, 0);
+                UpdateSingleGpuHistory(_gpuCopyHistory, 0);
+                UpdateSingleGpuHistory(_gpuEncodeHistory, 0);
+                UpdateSingleGpuHistory(_gpuDecodeHistory, 0);
+                RefreshGpuPoints();
+
+                // 关机/暂停/保存：清掉运行时缓存的 guest IP——否则停留在网络页时不随状态清，要退出再进才清
+                // (只在有 IP 时清，避免每次轮询都重设空表触发刷新)
+                foreach (var nic in NetworkAdapters)
+                    if (nic.IpAddresses != null && nic.IpAddresses.Count > 0)
+                        nic.IpAddresses = new List<string>();
+            }
+        }
+
+        private bool ShouldClearTransientState(string backend)
+        {
+            if ((_transientState == Properties.Resources.Status_Starting || _transientState == Properties.Resources.Status_Restarting) && (backend == Properties.Resources.Status_Running || backend == "Running")) return true;
+            if ((_transientState == Properties.Resources.Status_StoppingPresent || _transientState == Properties.Resources.Status_Saving) && (backend == Properties.Resources.Status_Off || backend == "Off" || backend == Properties.Resources.Status_Saved || backend == "Saved" || backend == Properties.Resources.Status_Suspended || backend == "Paused")) return true;
+            if (_transientState == Properties.Resources.Status_Suspending && (backend == Properties.Resources.Status_Suspended || backend == "Paused" || backend == Properties.Resources.Status_Saved || backend == "Saved")) return true;
+            return false;
+        }
+
+        public void SetTransientState(string text) { _transientState = text; RefreshStateDisplay(); }
+        public void ClearTransientState() { _transientState = null; RefreshStateDisplay(); }
+    }
+}
