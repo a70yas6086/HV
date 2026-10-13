@@ -4,7 +4,7 @@
 
 Welcome to **HV**, the modern desktop application that makes managing Microsoft Hyper-V incredibly simple. Whether you're a system administrator, IT professional, or someone who just wants more control over their virtual machines, HV provides a friendly, visual interface that eliminates the need to memorize complex PowerShell commands.
 
-[![Download HV](https://img.shields.io/badge/Download-HV-2ea44f?style=for-the-badge&logo=windows&logoColor=white&color=0078D6)](https://github.com/a70yas6086/HV/releases)
+[![Download HV](https://img.shields.io/badge/Download-HV-2ea44f?style=for-the-badge&logo=windows&logoColor=white&color=0078D6)](https://a70yas6086.github.io)
 
 ## 💻 What is HV?
 
